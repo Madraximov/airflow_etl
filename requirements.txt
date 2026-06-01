@@ -1,0 +1,4 @@
+apache-airflow==2.8.1
+psycopg2-binary==2.9.9
+pandas==2.1.4
+pytest==7.4.4
