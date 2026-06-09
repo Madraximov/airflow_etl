@@ -1,4 +1,6 @@
--- Staging layer: raw data landing zone
+-- Staging layer: raw data landing zone (loaded by Airflow from CSV).
+-- Everything downstream of these tables (the `staging` cleaned views, the
+-- `dwh` star schema and the `datamart` views) is built and tested by dbt.
 CREATE SCHEMA IF NOT EXISTS staging;
 
 CREATE TABLE IF NOT EXISTS staging.orders (

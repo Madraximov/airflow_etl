@@ -1,24 +1,28 @@
 """
 E-Commerce ETL Pipeline
 -----------------------
-Full ELT: CSV → Staging → DWH (Star Schema) → Data Mart views
+Extract/Load handled by Airflow (CSV → staging landing tables); all
+transformation, the star-schema build and data-quality testing are handled by
+dbt (`dbt build` runs models + tests in dependency order):
+
+    CSV → staging → [dbt] → dwh (star schema) → datamart views
+
 Schedule: daily at 02:00 UTC
 """
 from __future__ import annotations
 
 import csv
 import os
-import sys
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from airflow.decorators import dag, task
+from airflow.operators.bash import BashOperator
 from airflow.operators.empty import EmptyOperator
-
-sys.path.insert(0, "/opt/airflow/plugins")
 
 DATA_DIR = Path("/opt/airflow/data")
 SQL_DIR = Path("/opt/airflow/sql")
+DBT_DIR = "/opt/airflow/dbt"
 
 DEFAULT_ARGS = {
     "owner": "data-engineering",
@@ -54,25 +58,18 @@ def _run_sql_file(path: Path) -> None:
         conn.close()
 
 
-def _to_int_date(val: str) -> int | None:
-    try:
-        return int(datetime.strptime(val, "%Y-%m-%d").strftime("%Y%m%d"))
-    except (ValueError, TypeError):
-        return None
-
-
 # ---------------------------------------------------------------------------
 # DAG
 # ---------------------------------------------------------------------------
 
 @dag(
     dag_id="etl_ecommerce",
-    description="E-Commerce ELT: CSV → Staging → DWH → Data Mart",
+    description="E-Commerce ELT: CSV → Staging (Airflow) → DWH → Data Mart (dbt)",
     schedule="0 2 * * *",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     default_args=DEFAULT_ARGS,
-    tags=["ecommerce", "etl", "dwh"],
+    tags=["ecommerce", "etl", "dwh", "dbt"],
 )
 def etl_ecommerce():
 
@@ -80,7 +77,7 @@ def etl_ecommerce():
     end = EmptyOperator(task_id="end")
 
     # ------------------------------------------------------------------
-    # STEP 1 — Initialize schema
+    # STEP 1 — Initialize the raw staging landing zone
     # ------------------------------------------------------------------
     @task
     def init_schema():
@@ -105,7 +102,7 @@ def etl_ecommerce():
         return stats
 
     # ------------------------------------------------------------------
-    # STEP 3 — Load staging
+    # STEP 3 — Load raw CSVs into the staging landing tables
     # ------------------------------------------------------------------
     @task
     def load_staging_customers():
@@ -167,178 +164,28 @@ def etl_ecommerce():
             conn.close()
 
     # ------------------------------------------------------------------
-    # STEP 4 — Transform & Load dimensions (SCD Type 2 for customers/products)
+    # STEP 4 — Transform + test with dbt
+    #   `dbt build` runs, in dependency order:
+    #     staging views → dwh dims/fact (tables) → datamart views,
+    #   running every schema/data test as it goes. A failed test fails the task.
     # ------------------------------------------------------------------
-    @task
-    def load_dim_date():
-        conn = _get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT MIN(order_date::date), MAX(ship_date::date) FROM staging.orders")
-                min_d, max_d = cur.fetchone()
-            if min_d is None:
-                return
-
-            rows = []
-            d = min_d
-            while d <= max_d:
-                rows.append((
-                    int(d.strftime("%Y%m%d")), d,
-                    d.year, (d.month - 1) // 3 + 1, d.month,
-                    d.strftime("%B"), d.isocalendar()[1],
-                    d.weekday(), d.strftime("%A"),
-                    d.weekday() >= 5,
-                ))
-                d += timedelta(days=1)
-
-            from psycopg2.extras import execute_values
-            with conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO dwh.dim_date
-                      (date_key, full_date, year, quarter, month, month_name,
-                       week, day_of_week, day_name, is_weekend)
-                    VALUES %s
-                    ON CONFLICT (date_key) DO NOTHING
-                    """,
-                    rows,
-                )
-            conn.commit()
-            print(f"Loaded {len(rows)} date dimension rows")
-        finally:
-            conn.close()
-
-    @task
-    def load_dim_customer():
-        conn = _get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO dwh.dim_customer (customer_id, customer_name, segment)
-                    SELECT DISTINCT customer_id, customer_name, segment
-                    FROM staging.customers
-                    ON CONFLICT (customer_id)
-                    DO UPDATE SET
-                        customer_name = EXCLUDED.customer_name,
-                        segment       = EXCLUDED.segment
-                """)
-            conn.commit()
-            print("Dimension customers updated")
-        finally:
-            conn.close()
-
-    @task
-    def load_dim_product():
-        conn = _get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO dwh.dim_product (product_id, product_name, category, sub_category)
-                    SELECT DISTINCT product_id, product_name, category, sub_category
-                    FROM staging.orders
-                    ON CONFLICT (product_id)
-                    DO UPDATE SET
-                        product_name = EXCLUDED.product_name,
-                        category     = EXCLUDED.category,
-                        sub_category = EXCLUDED.sub_category
-                """)
-            conn.commit()
-            print("Dimension products updated")
-        finally:
-            conn.close()
-
-    @task
-    def load_dim_geography():
-        conn = _get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO dwh.dim_geography (city, state, country, region)
-                    SELECT DISTINCT city, state, country, region
-                    FROM staging.orders
-                    ON CONFLICT (city, state, country) DO NOTHING
-                """)
-            conn.commit()
-            print("Dimension geography updated")
-        finally:
-            conn.close()
-
-    # ------------------------------------------------------------------
-    # STEP 5 — Load fact table
-    # ------------------------------------------------------------------
-    @task
-    def load_fact_sales():
-        conn = _get_conn()
-        try:
-            with conn.cursor() as cur:
-                # Avoid duplicates on reload: delete today's batch by _loaded_at
-                cur.execute("DELETE FROM dwh.fact_sales WHERE _loaded_at::date = CURRENT_DATE")
-                cur.execute("""
-                    INSERT INTO dwh.fact_sales
-                      (order_id, order_date_key, ship_date_key,
-                       customer_key, product_key, geo_key,
-                       ship_mode, quantity, sales, discount, profit)
-                    SELECT
-                        o.order_id,
-                        o.order_date::date::text::integer * 0 +  -- computed below
-                        CAST(TO_CHAR(o.order_date::date, 'YYYYMMDD') AS INTEGER),
-                        CAST(TO_CHAR(o.ship_date::date, 'YYYYMMDD') AS INTEGER),
-                        c.customer_key,
-                        p.product_key,
-                        g.geo_key,
-                        o.ship_mode,
-                        o.quantity,
-                        o.sales,
-                        o.discount,
-                        o.profit
-                    FROM staging.orders o
-                    JOIN dwh.dim_customer  c ON c.customer_id = o.customer_id  AND c.is_current
-                    JOIN dwh.dim_product   p ON p.product_id  = o.product_id   AND p.is_current
-                    JOIN dwh.dim_geography g ON g.city = o.city AND g.state = o.state
-                                            AND g.country = o.country
-                """)
-            conn.commit()
-            print("Fact sales loaded")
-        finally:
-            conn.close()
-
-    # ------------------------------------------------------------------
-    # STEP 6 — Data quality checks
-    # ------------------------------------------------------------------
-    @task
-    def data_quality_checks():
-        conn = _get_conn()
-        checks_failed = []
-        try:
-            with conn.cursor() as cur:
-                # Check 1: no nulls in fact keys
-                cur.execute("""
-                    SELECT COUNT(*) FROM dwh.fact_sales
-                    WHERE order_date_key IS NULL OR customer_key IS NULL OR product_key IS NULL
-                """)
-                null_keys = cur.fetchone()[0]
-                if null_keys > 0:
-                    checks_failed.append(f"Null FK keys in fact_sales: {null_keys} rows")
-
-                # Check 2: negative sales
-                cur.execute("SELECT COUNT(*) FROM dwh.fact_sales WHERE sales < 0")
-                neg_sales = cur.fetchone()[0]
-                if neg_sales > 0:
-                    checks_failed.append(f"Negative sales: {neg_sales} rows")
-
-                # Check 3: row count sanity
-                cur.execute("SELECT COUNT(*) FROM dwh.fact_sales")
-                total = cur.fetchone()[0]
-                print(f"Total fact_sales rows: {total}")
-                if total == 0:
-                    checks_failed.append("fact_sales is empty!")
-
-            if checks_failed:
-                raise ValueError("DQ failures:\n" + "\n".join(checks_failed))
-            print("All data quality checks passed.")
-        finally:
-            conn.close()
+    dbt_build = BashOperator(
+        task_id="dbt_build",
+        bash_command=(
+            f"cd {DBT_DIR} && "
+            f"dbt build --project-dir {DBT_DIR} --profiles-dir {DBT_DIR}"
+        ),
+        env={
+            "DBT_PROFILES_DIR": DBT_DIR,
+            "DW_HOST": os.getenv("DW_HOST", "postgres-dw"),
+            "DW_PORT": os.getenv("DW_PORT", "5432"),
+            "DW_DB": os.getenv("DW_DB", "ecommerce_dw"),
+            "DW_USER": os.getenv("DW_USER", "dw_user"),
+            "DW_PASSWORD": os.getenv("DW_PASSWORD", "dw_password"),
+            "PATH": os.getenv("PATH", ""),
+        },
+        append_env=True,
+    )
 
     # ------------------------------------------------------------------
     # Wire up the DAG
@@ -347,21 +194,13 @@ def etl_ecommerce():
     validated = extract_validate()
     stg_customers = load_staging_customers()
     stg_orders = load_staging_orders()
-    dim_date = load_dim_date()
-    dim_customer = load_dim_customer()
-    dim_product = load_dim_product()
-    dim_geo = load_dim_geography()
-    fact = load_fact_sales()
-    dq = data_quality_checks()
 
     (
         start
         >> schema
         >> validated
         >> [stg_customers, stg_orders]
-        >> [dim_date, dim_customer, dim_product, dim_geo]
-        >> fact
-        >> dq
+        >> dbt_build
         >> end
     )
 

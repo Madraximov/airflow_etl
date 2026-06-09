@@ -15,6 +15,9 @@ x-airflow-common: &airflow-common
     DW_DB: ecommerce_dw
     DW_USER: dw_user
     DW_PASSWORD: dw_password
+    DBT_PROFILES_DIR: /opt/airflow/dbt
+    # Install dbt into the Airflow containers at startup so the DAG can run it.
+    _PIP_ADDITIONAL_REQUIREMENTS: 'dbt-postgres==1.9.0'
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
@@ -22,6 +25,7 @@ x-airflow-common: &airflow-common
     - ./data:/opt/airflow/data
     - ./sql:/opt/airflow/sql
     - ./scripts:/opt/airflow/scripts
+    - ./dbt:/opt/airflow/dbt
   depends_on:
     postgres-airflow:
       condition: service_healthy

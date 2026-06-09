@@ -1,55 +1,71 @@
 # E-Commerce ETL Pipeline
 
-End-to-end data engineering project: daily batch ETL pipeline that ingests raw e-commerce data, transforms it into a star-schema Data Warehouse, and exposes aggregated Data Mart views for analytics.
+End-to-end data engineering project: daily batch ELT pipeline that ingests raw e-commerce data, transforms it into a star-schema Data Warehouse with **dbt**, and exposes aggregated Data Mart views for analytics. Airflow handles extract/load; dbt owns every transformation and tests it.
 
 ## Architecture
 
 ```
 CSV Files (raw)
-      │
+      │  Apache Airflow — extract + load (DAG: etl_ecommerce, daily 02:00 UTC)
       ▼
-┌─────────────┐     Apache Airflow (scheduler + webserver)
-│   Staging   │  ◄──────────────────────────────────────────
-│  (landing)  │     DAG: etl_ecommerce — runs daily 02:00 UTC
+┌─────────────┐
+│   staging   │  raw landing tables (orders, customers)
+│  (landing)  │
 └─────────────┘
-      │
+      │  ────────────  dbt build (models + tests)  ────────────
+      ▼
+┌─────────────┐
+│   staging   │  stg_orders, stg_customers      (cleaned/typed views)
+└─────────────┘
       ▼
 ┌──────────────────────────────────────┐
-│          Data Warehouse (Star Schema)│
-│                                      │
+│       Data Warehouse — dwh (Star)    │
 │  dim_date    dim_customer            │
 │  dim_product dim_geography           │
 │         └──► fact_sales ◄──┘        │
 └──────────────────────────────────────┘
-      │
       ▼
 ┌─────────────┐
-│  Data Mart  │  monthly_sales · customer_ltv · product_performance
+│  datamart   │  monthly_sales · customer_ltv · product_performance
 │   (views)   │
 └─────────────┘
 ```
+
+The Airflow DAG loads the raw CSVs into the `staging` landing tables, then runs
+`dbt build`, which constructs the cleaned staging views, the `dwh` star schema
+and the `datamart` views **in dependency order** and runs every data-quality
+test along the way. See [`dbt/README.md`](dbt/README.md) for the dbt project.
 
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
 | Orchestration | Apache Airflow 2.8 |
+| Transformation | dbt (dbt-postgres 1.9) |
 | Storage | PostgreSQL 15 |
 | Language | Python 3.11 |
 | Containerization | Docker Compose |
-| Testing | pytest |
+| Testing | pytest · dbt tests |
 
 ## Project Structure
 
 ```
 airflow_etl/
 ├── dags/
-│   └── etl_ecommerce.py       # Main DAG (TaskFlow API)
+│   └── etl_ecommerce.py       # Main DAG: load staging + run dbt
+├── dbt/                       # dbt project — owns dwh + datamart transforms
+│   ├── models/
+│   │   ├── staging/           # stg_orders, stg_customers (sources → views)
+│   │   └── marts/
+│   │       ├── core/          # dim_*, fact_sales (star schema, tables)
+│   │       └── datamart/      # monthly_sales, customer_ltv, product_performance
+│   ├── tests/                 # singular data tests
+│   ├── macros/                # generate_schema_name override
+│   ├── dbt_project.yml
+│   └── profiles.yml
 ├── sql/
 │   └── ddl/
-│       ├── 01_create_staging.sql
-│       ├── 02_create_dwh.sql  # Star schema
-│       └── 03_create_datamart.sql
+│       └── 01_create_staging.sql   # raw landing zone (dwh/datamart now in dbt)
 ├── scripts/
 │   └── generate_data.py       # Synthetic dataset generator (5 000 orders)
 ├── plugins/
@@ -93,22 +109,21 @@ psql -h localhost -p 5433 -U dw_user -d ecommerce_dw \
 start → init_schema → extract_validate
       → load_staging_customers
       → load_staging_orders
-      → load_dim_date
-      → load_dim_customer
-      → load_dim_product
-      → load_dim_geography
-      → load_fact_sales
-      → data_quality_checks
+      → dbt_build        # dbt: staging → dwh (star) → datamart + all tests
       → end
 ```
 
 ## Data Quality Checks
 
-The pipeline includes automated checks after every load:
+Data quality is enforced as **dbt tests**, run automatically by `dbt build`
+(a failing test fails the `dbt_build` task):
 
-- No NULL foreign keys in `fact_sales`
-- No negative sales values
-- Row-count sanity (empty table alert)
+- No NULL / orphaned foreign keys in `fact_sales` (`not_null` + `relationships`)
+- No negative sales values (`tests/assert_fact_sales_non_negative.sql`)
+- Row-count sanity / empty-table alert (`tests/assert_fact_sales_not_empty.sql`)
+- `unique` + `not_null` on every dimension key; `accepted_values` on segment
+
+Run them on their own with `dbt test` (see `dbt/README.md`).
 
 ## Data Mart Queries
 
@@ -133,13 +148,21 @@ ORDER BY total_revenue DESC;
 ## Running Tests
 
 ```bash
+# Python unit tests (data generator + helpers)
 pip install pytest
 pytest tests/ -v
+
+# dbt model + data-quality tests (needs the warehouse running)
+cd dbt
+export DW_HOST=localhost DW_PORT=5433
+dbt build --project-dir . --profiles-dir .   # build + test
+dbt test  --project-dir . --profiles-dir .   # tests only
 ```
 
 ## Key Design Decisions
 
-- **Idempotent loads** — staging tables are truncated before each load; fact table deletes today's batch before re-inserting, so re-runs are safe.
+- **ELT with dbt** — extraction/loading stays in Airflow; all transformation logic lives in version-controlled, tested dbt models. Lineage, docs and tests come for free (`dbt docs serve`).
+- **Idempotent rebuilds** — staging is truncated before each load; dbt rebuilds the `dwh` tables from scratch and uses deterministic hash surrogate keys, so re-runs always converge to the same result.
 - **Star schema** — separates business dimensions (date, customer, product, geography) from measures for optimal query performance.
-- **SCD awareness** — `is_current` / `valid_from` / `valid_to` columns on `dim_customer` and `dim_product` are ready for Type 2 slowly-changing dimension logic.
-- **TaskFlow API** — Airflow 2.x decorator syntax keeps DAG code clean and testable.
+- **SCD awareness** — `is_current` / `valid_from` / `valid_to` columns on `dim_customer` and `dim_product` are ready to be converted into dbt snapshots for Type 2 history.
+- **Tests as gates** — the original imperative DQ checks are now declarative dbt tests that block the pipeline on failure.

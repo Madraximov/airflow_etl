@@ -1,0 +1,37 @@
+name: 'ecommerce_dwh'
+version: '1.0.0'
+config-version: 2
+
+# This profile lives in ./profiles.yml (point dbt at it with
+# --profiles-dir . or the DBT_PROFILES_DIR env var).
+profile: 'ecommerce_dwh'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# ---------------------------------------------------------------------------
+# Layered materializations — mirrors the original schemas:
+#   staging   → cleaned/typed views over the raw landing tables
+#   dwh       → star-schema dimensions + fact (persisted tables)
+#   datamart  → aggregated reporting views
+# ---------------------------------------------------------------------------
+models:
+  ecommerce_dwh:
+    staging:
+      +schema: staging
+      +materialized: view
+    marts:
+      core:
+        +schema: dwh
+        +materialized: table
+      datamart:
+        +schema: datamart
+        +materialized: view

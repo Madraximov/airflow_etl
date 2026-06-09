@@ -1,0 +1,17 @@
+# Connection profile for the e-commerce data warehouse.
+# Credentials are read from the same env vars the Airflow containers use,
+# with sensible local-dev defaults.
+ecommerce_dwh:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DW_HOST', 'postgres-dw') }}"
+      port: "{{ env_var('DW_PORT', '5432') | int }}"
+      user: "{{ env_var('DW_USER', 'dw_user') }}"
+      password: "{{ env_var('DW_PASSWORD', 'dw_password') }}"
+      dbname: "{{ env_var('DW_DB', 'ecommerce_dw') }}"
+      schema: public          # overridden per-folder via generate_schema_name
+      threads: 4
+      keepalives_idle: 0
+      sslmode: prefer

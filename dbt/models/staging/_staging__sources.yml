@@ -1,0 +1,30 @@
+version: 2
+
+sources:
+  - name: staging
+    description: >
+      Raw landing tables loaded by the Airflow DAG straight from the source
+      CSV files. dbt treats these as read-only sources.
+    schema: staging
+    tables:
+      - name: orders
+        description: One row per order line as delivered in orders.csv.
+        columns:
+          - name: order_id
+            description: Natural key of the order line.
+            data_tests:
+              - not_null
+          - name: customer_id
+            data_tests:
+              - not_null
+          - name: product_id
+            data_tests:
+              - not_null
+      - name: customers
+        description: One row per customer as delivered in customers.csv.
+        columns:
+          - name: customer_id
+            description: Natural key of the customer.
+            data_tests:
+              - not_null
+              - unique

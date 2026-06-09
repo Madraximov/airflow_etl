@@ -1,0 +1,9 @@
+version: 2
+
+models:
+  - name: monthly_sales
+    description: Monthly revenue/profit by product category and region.
+  - name: customer_ltv
+    description: Per-customer lifetime orders, revenue, profit and tenure.
+  - name: product_performance
+    description: Per-product order counts, units sold, revenue and margin.
