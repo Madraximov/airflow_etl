@@ -32,10 +32,7 @@ from airflow.utils.email import send_email
 CLICKHOUSE_CONN_ID = "tk-bpl-chdb-2"
 REPORT_DIR         = "/tmp/airflow_reports"
 EMAIL_RECIPIENTS   = [
-    "AMadrakhimov@beeline.uz",
-    "ShKozhanazarova@beelab.uz",
-    "ABogdanova@beelab.uz",
-    "ZAKamalov@beelab.uz",
+    "AMadrakhimov@beeline.uz"
 ]
 
 # Excel sheet names (max 31 chars) paired with a human-readable title.
